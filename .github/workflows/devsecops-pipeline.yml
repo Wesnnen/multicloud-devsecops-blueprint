@@ -1,0 +1,92 @@
+```yaml
+name: DevSecOps Multi-Cloud CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  IMAGE_NAME: resilient-api-service
+  AWS_REGION: us-east-1
+
+jobs:
+  # =========================================================================
+  # STAGE 1: SHIFT-LEFT SECURITY (SECRET SCANNING & SAST)
+  # =========================================================================
+  security-code-scan:
+    name: "1. SAST & Secret Scanning"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks (Secret Detection)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Semgrep (SAST - OWASP Top 10)
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/secrets
+            p/owasp-top-ten
+            p/docker
+
+  # =========================================================================
+  # STAGE 2: CONTAINER BUILD & VULNERABILITY SCANNING (SCA / TRIVY)
+  # =========================================================================
+  build-and-scan-image:
+    name: "2. Container Build & Trivy CVE Scan"
+    needs: security-code-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Build Hardened Docker Image
+        run: |
+          docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+
+      - name: Run Trivy Vulnerability Scanner (Block HIGH/CRITICAL CVEs)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.IMAGE_NAME }}:${{ github.sha }}'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+  # =========================================================================
+  # STAGE 3: MULTI-CLOUD DEPLOYMENT (AWS ECR / ECS EXAMPLE)
+  # =========================================================================
+  deploy-cloud:
+    name: "3. Deploy to Cloud (AWS ECR & ECS)"
+    needs: build-and-scan-image
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials (OIDC / IAM Least Privilege)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push Hardened Image to ECR & Update ECS Service
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker tag ${{ env.IMAGE_NAME }}:${{ github.sha }} $ECR_REGISTRY/${{ env.IMAGE_NAME }}:latest
+          docker push $ECR_REGISTRY/${{ env.IMAGE_NAME }}:latest
+          aws ecs update-service --cluster production-cluster --service api-service --force-new-deployment
